@@ -43,28 +43,37 @@
 #define DISABLE_OPENMP 1
 #define DMLC_LOG_STACK_TRACE 0
 
+#include "src/common/utils.cc"
 
 #include "src/ndarray/ndarray_function.cc"
 #include "src/ndarray/ndarray.cc"
 
 #include "src/imperative/imperative.cc"
+#include "src/imperative/imperative_utils.cc"
 #include "src/imperative/cached_op.cc"
+#include "src/imperative/imperative_utils.cc"
 
 #include "src/engine/engine.cc"
 #include "src/engine/naive_engine.cc"
+#include "src/engine/openmp.cc"
 
 #include "src/profiler/profiler.cc"
+#include "src/profiler/aggregate_stats.cc"
 
 #include "src/executor/graph_executor.cc"
 #include "src/executor/attach_op_execs_pass.cc"
 #include "src/executor/attach_op_resource_pass.cc"
 #include "src/executor/inplace_addto_detect_pass.cc"
+#include "src/executor/infer_graph_attr_pass.cc"
 
+#include "src/nnvm/plan_memory.cc"
 #include "src/nnvm/legacy_json_util.cc"
 #include "src/nnvm/legacy_op_util.cc"
+#include "src/nnvm/graph_editor.cc"
 
 #include "src/operator/operator.cc"
 #include "src/operator/operator_util.cc"
+#include "src/operator/pad.cc"
 #include "src/operator/nn/activation.cc"
 #include "src/operator/nn/batch_norm.cc"
 #include "src/operator/nn/concat.cc"
@@ -74,7 +83,7 @@
 #include "src/operator/nn/fully_connected.cc"
 #include "src/operator/leaky_relu.cc"
 #include "src/operator/nn/pooling.cc"
-#include "src/operator/nn/softmax_activation.cc"
+#include "src/operator/nn/softmax.cc"
 #include "src/operator/softmax_output.cc"
 #include "src/operator/tensor/elemwise_binary_broadcast_op_basic.cc"
 #include "src/operator/tensor/elemwise_binary_op.cc"
@@ -83,6 +92,11 @@
 #include "src/operator/tensor/elemwise_unary_op_basic.cc"
 #include "src/operator/tensor/elemwise_unary_op_trig.cc"
 #include "src/operator/tensor/matrix_op.cc"
+#include "src/operator/contrib/binary_inference/xnor.cc"
+#include "src/operator/contrib/binary_inference/binary_inference_convolution.cc"
+#include "src/operator/contrib/binary_inference/binary_inference_fully_connected.cc"
+
+#include "src/profiler/aggregate_stats.cc"
 
 #include "src/storage/storage.cc"
 
@@ -93,4 +107,5 @@
 #include "src/c_api/c_api_symbolic.cc"
 #include "src/c_api/c_api_ndarray.cc"
 #include "src/c_api/c_api_error.cc"
+#include "src/c_api/c_api_profile.cc"
 

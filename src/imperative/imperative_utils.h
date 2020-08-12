@@ -31,6 +31,7 @@
 #include "../common/utils.h"
 #include "../common/exec_utils.h"
 #include "../operator/nn/mkldnn/mkldnn_base-inl.h"
+#include "../operator/operator_common.h"
 
 #ifndef MXNET_IMPERATIVE_IMPERATIVE_UTILS_H_
 #define MXNET_IMPERATIVE_IMPERATIVE_UTILS_H_
@@ -100,18 +101,18 @@ inline void SetShapeType(const Context& ctx,
                          const std::vector<NDArray*>& inputs,
                          const std::vector<NDArray*>& outputs,
                          DispatchMode* dispatch_mode) {
-  static auto& infershape = nnvm::Op::GetAttr<nnvm::FInferShape>("FInferShape");
+  static auto& infershape = nnvm::Op::GetAttr<mxnet::FInferShape>("FInferShape");
   static auto& infertype = nnvm::Op::GetAttr<nnvm::FInferType>("FInferType");
   static auto& inferstorage = nnvm::Op::GetAttr<FInferStorageType>("FInferStorageType");
   MXAPIThreadLocalEntry *ret = MXAPIThreadLocalStore::Get();
   // infer shape
-  std::vector<TShape>& in_shapes  = ret->arg_shapes;
+  mxnet::ShapeVector& in_shapes  = ret->arg_shapes;
   in_shapes.clear();
   in_shapes.reserve(inputs.size());
   for (auto& i : inputs) {
     in_shapes.push_back(i->shape());
   }
-  std::vector<TShape>& out_shapes = ret->out_shapes;
+  mxnet::ShapeVector& out_shapes = ret->out_shapes;
   out_shapes.clear();
   out_shapes.reserve(outputs.size());
   for (auto& i : outputs) {
@@ -121,7 +122,28 @@ inline void SetShapeType(const Context& ctx,
   if (!infershape.count(attrs.op)) {
     is_dynamic_shape_existing = true;
   } else {
-    CHECK(infershape[attrs.op](attrs, &in_shapes, &out_shapes));
+    if (!Imperative::Get()->is_np_shape()) {
+      common::ConvertToNumpyShape(&in_shapes);
+      common::ConvertToNumpyShape(&out_shapes);
+    }
+    const bool success = infershape[attrs.op](attrs, &in_shapes, &out_shapes);
+    if (!success) {
+      std::stringstream os;
+      os << "Operator " << attrs.op->name << " inferring shapes failed.\n";
+      os << "input shapes:\n";
+      for (const auto& s : in_shapes) {
+        os << s << '\n';
+      }
+      os << "output shapes:\n";
+      for (const auto& s : out_shapes) {
+        os << s << '\n';
+      }
+      os << "operator attributes:\n";
+      for (const auto& kv : attrs.dict) {
+        os << kv.first << " : " << kv.second << '\n';
+      }
+      LOG(FATAL) << os.str();
+    }
     CHECK_EQ(out_shapes.size(), outputs.size());
   }
   // infer type
@@ -179,7 +201,7 @@ inline void SetShapeType(const Context& ctx,
 
   for (size_t i = 0; i < outputs.size(); ++i) {
     NDArrayStorageType storage_type = static_cast<NDArrayStorageType>(out_storage_types[i]);
-    if (outputs[i]->is_none()) {
+    if (outputs[i]->is_none() || mxnet::op::shape_is_none(outputs[i]->shape())) {
       if (is_dynamic_shape_existing) {
         // once there is dynamic shape somewhere, we could not pre-determine the shape.
         *outputs[i] = NDArray(ctx, out_types[i]);
@@ -241,6 +263,12 @@ inline void SetDependency(const nnvm::NodeAttrs& attrs,
         requested.push_back(ResourceManager::Get()->Request(ctx, req));
         write_vars.push_back(requested.back().var);
         break;
+#if MXNET_USE_CUDNN == 1 && CUDNN_MAJOR >= 7
+       case ResourceRequest::kCuDNNDropoutDesc:
+        requested.push_back(ResourceManager::Get()->Request(ctx, req));
+        write_vars.push_back(requested.back().var);
+        break;
+#endif  // MXNET_USE_CUDNN == 1 && CUDNN_MAJOR >= 7
        default:
         LOG(FATAL) << "resource type not yet supported";
       }
@@ -391,7 +419,14 @@ inline void PushFCompute(const FCompute& fn,
       // mapping from index in input_blobs to index in pre_temp_dst
       std::unordered_map<uint32_t, uint32_t> in_temp_idx_map;
 #if MXNET_USE_MKLDNN == 1
-      InvalidateOutputs(outputs, req);
+      if (exec_type != ExecType::kCrossDeviceCopy) {
+        // kCrossDeviceCopy is used for `_copy_to` operator, which doesn't compute immediately in
+        // its FCcomputeEx, but AsyncPush the copy operation to engine.
+        // So for the case that A is holding mkldnn memory, and then copy A to B, and then copy B
+        // back to A, we shouldn't invalidate outputs for copying B back to A, because at this time,
+        // copying A to B may not happen, and will corrupt A's memory.
+        InvalidateOutputs(outputs, req);
+      }
 #endif
       std::vector<OpReqType> tmp_req = req;
       // setup blobs
@@ -406,7 +441,7 @@ inline void PushFCompute(const FCompute& fn,
       fn(attrs, opctx, input_blobs, tmp_req, output_blobs);
       // post-fcompute fallback, cast to original storage type
       CastNonDefaultStorage(post_temp_src, post_temp_dst, opctx, is_gpu);
-      if (is_gpu) {
+      if (is_gpu && !rctx.is_bulk) {
         rctx.get_stream<gpu>()->Wait();
       }
     }, ctx, read_vars, write_vars, FnProperty::kNormal,
@@ -433,7 +468,14 @@ inline void PushFComputeEx(const FComputeEx& fn,
   const auto& run = [=](RunContext rctx) {
       OpContext opctx{need_grad, is_train, rctx, engine::CallbackOnComplete(), requested};
 #if MXNET_USE_MKLDNN == 1
-      InvalidateOutputs(outputs, req);
+      if (exec_type != ExecType::kCrossDeviceCopy) {
+        // kCrossDeviceCopy is used for `_copy_to` operator, which doesn't compute immediately in
+        // its FCcomputeEx, but AsyncPush the copy operation to engine.
+        // So for the case that A is holding mkldnn memory, and then copy A to B, and then copy B
+        // back to A, we shouldn't invalidate outputs for copying B back to A, because at this time,
+        // copying A to B may not happen, and will corrupt A's memory.
+        InvalidateOutputs(outputs, req);
+      }
 #endif
       fn(attrs, opctx, inputs, req, outputs);
       if (ctx.dev_mask() == gpu::kDevMask && exec_type == ExecType::kSync) {
@@ -442,7 +484,7 @@ inline void PushFComputeEx(const FComputeEx& fn,
     };
 
   if (exec_type == ExecType::kCrossDeviceCopy) {
-    run(RunContext{ctx, nullptr});
+    run(RunContext{ctx, nullptr, nullptr, false});
   } else {
     CHECK(exec_type == ExecType::kSync);
     Engine::Get()->PushSync(run, ctx, read_vars, write_vars, FnProperty::kNormal,
@@ -480,7 +522,14 @@ inline void PushOperator(const OpStatePtr& state,
                           engine::CallbackOnComplete on_complete) {
       OpContext opctx{need_grad, is_train, rctx, on_complete, requested};
 #if MXNET_USE_MKLDNN == 1
-      InvalidateOutputs(outputs, req);
+      if (exec_type != ExecType::kCrossDeviceCopy) {
+        // kCrossDeviceCopy is used for `_copy_to` operator, which doesn't compute immediately in
+        // its FCcomputeEx, but AsyncPush the copy operation to engine.
+        // So for the case that A is holding mkldnn memory, and then copy A to B, and then copy B
+        // back to A, we shouldn't invalidate outputs for copying B back to A, because at this time,
+        // copying A to B may not happen, and will corrupt A's memory.
+        InvalidateOutputs(outputs, req);
+      }
 #endif
       fcompute_ex(state, opctx, inputs, req, outputs);
       if (ctx.dev_mask() == gpu::kDevMask && exec_type == ExecType::kSync
@@ -492,7 +541,7 @@ inline void PushOperator(const OpStatePtr& state,
     // For operators with subgraphs, we need to invoke them in the main thread
     // instead of the threaded engine.
     if (exec_type == ExecType::kSubgraphExec) {
-      RunContext rctx{ctx, nullptr};
+      RunContext rctx{ctx, nullptr, nullptr, false};
       run(rctx, engine::CallbackOnComplete());
     } else if (exec_type == ExecType::kSync) {
       Engine::Get()->PushSync(
@@ -519,7 +568,14 @@ inline void PushOperator(const OpStatePtr& state,
         // mapping from index in input_blobs to index in pre_temp_dst
         std::unordered_map<uint32_t, uint32_t> in_temp_idx_map;
 #if MXNET_USE_MKLDNN == 1
+      if (exec_type != ExecType::kCrossDeviceCopy) {
+        // kCrossDeviceCopy is used for `_copy_to` operator, which doesn't compute immediately in
+        // its FCcomputeEx, but AsyncPush the copy operation to engine.
+        // So for the case that A is holding mkldnn memory, and then copy A to B, and then copy B
+        // back to A, we shouldn't invalidate outputs for copying B back to A, because at this time,
+        // copying A to B may not happen, and will corrupt A's memory.
         InvalidateOutputs(outputs, req);
+      }
 #endif
         std::vector<OpReqType> tmp_req = req;
         // populate input blobs and output blobs
@@ -540,7 +596,7 @@ inline void PushOperator(const OpStatePtr& state,
       };
 
     if (exec_type == ExecType::kSubgraphExec) {
-      RunContext rctx{ctx, nullptr};
+      RunContext rctx{ctx, nullptr, nullptr, false};
       run(rctx, engine::CallbackOnComplete());
     } else if (exec_type == ExecType::kSync) {
       Engine::Get()->PushSync(
@@ -557,29 +613,34 @@ inline void PushOperator(const OpStatePtr& state,
   }
 }
 
-inline bool CheckAndInferShape(nnvm::Graph* p_g, nnvm::ShapeVector&& shapes,
+inline bool CheckAndInferShape(nnvm::Graph* p_g, mxnet::ShapeVector&& shapes,
                                bool use_inputs,
                                std::pair<uint32_t, uint32_t> node_range = {0, 0},
-                               std::pair<uint32_t, uint32_t> entry_range = {0, 0}) {
+                               std::pair<uint32_t, uint32_t> entry_range = {0, 0},
+                               bool *contain_unknown = nullptr) {
   using namespace nnvm;
+  if (contain_unknown != nullptr) {
+    *contain_unknown = false;
+  }
   nnvm::Graph& g = *p_g;
   if (use_inputs) {
-    if (g.attrs.count("shape_inputs") &&
-        g.GetAttr<ShapeVector>("shape_inputs") == shapes) return true;
+    if (g.attrs.count("shape_inputs") && g.GetAttr<mxnet::ShapeVector>("shape_inputs") == shapes)
+      return true;
   } else if (g.attrs.count("shape")) {
-    const auto& prev_shapes = g.GetAttr<ShapeVector>("shape");
-    CHECK_EQ(prev_shapes.size(), shapes.size());
-    bool match = true;
-    for (size_t i = 0; i < shapes.size(); ++i) {
-      if (i == entry_range.first) {
-        i = entry_range.second;
-        if (i >= shapes.size()) break;
+    const auto& prev_shapes = g.GetAttr<mxnet::ShapeVector>("shape");
+    if (prev_shapes.size() == shapes.size()) {
+      bool match = true;
+      for (size_t i = 0; i < shapes.size(); ++i) {
+        if (i == entry_range.first) {
+          i = entry_range.second;
+          if (i >= shapes.size()) break;
+        }
+        if (shapes[i] == prev_shapes[i]) continue;
+        match = false;
+        break;
       }
-      if (shapes[i] == prev_shapes[i]) continue;
-      match = false;
-      break;
+      if (match) return true;
     }
-    if (match) return true;
   }
   g.attrs.erase("shape");
   g.attrs.erase("shape_inputs");
@@ -595,8 +656,11 @@ inline bool CheckAndInferShape(nnvm::Graph* p_g, nnvm::ShapeVector&& shapes,
     g.attrs["shape"] = std::make_shared<dmlc::any>(std::move(shapes));
     g = exec::InferShape(std::move(g));
   }
-  CHECK_EQ(g.GetAttr<size_t>("shape_num_unknown_nodes"), 0U);
-
+  if (contain_unknown == nullptr) {
+    CHECK_EQ(g.GetAttr<size_t>("shape_num_unknown_nodes"), 0U);
+  } else {
+    *contain_unknown = g.GetAttr<size_t>("shape_num_unknown_nodes") != 0U;
+  }
   return false;
 }
 
@@ -745,7 +809,7 @@ inline std::vector<Context> PlaceDevice(const nnvm::IndexedGraph& idx) {
 }
 
 
-inline MemoryPlanVector PlanMemory(
+inline MemoryPlanVector MXPlanMemory(
     nnvm::Graph* p_g,
     nnvm::StorageVector&& storage,
     const std::vector<uint32_t>& ref_count,
@@ -760,11 +824,11 @@ inline MemoryPlanVector PlanMemory(
   }
   g.attrs["ref_count"] = std::make_shared<dmlc::any>(ref_count);
   g.attrs["storage"] = std::make_shared<dmlc::any>(std::move(storage));
-  g = nnvm::ApplyPass(g, "PlanMemory");
+  g = nnvm::ApplyPass(g, "MXPlanMemory");
   if (detect_inplace_addto) g = exec::DetectInplaceAddTo(g);
 
   const auto& dtypes = g.GetAttr<DTypeVector>("dtype");
-  const auto& shapes = g.GetAttr<ShapeVector>("shape");
+  const auto& shapes = g.GetAttr<mxnet::ShapeVector>("shape");
   const auto& storage_inplace = g.GetAttr<std::vector<int> >("storage_inplace_index");
   const auto& storage_ids = g.GetAttr<StorageVector>("storage_id");
   uint32_t entry_start = entry_range.first;
@@ -805,7 +869,7 @@ inline std::multimap<size_t, NDArray> AllocateMemory(
     std::multimap<size_t, NDArray>&& pool = std::multimap<size_t, NDArray>()) {
   using namespace nnvm;
   const auto& dtypes = g.GetAttr<DTypeVector>("dtype");
-  const auto& shapes = g.GetAttr<ShapeVector>("shape");
+  const auto& shapes = g.GetAttr<mxnet::ShapeVector>("shape");
   const auto& stypes = g.GetAttr<StorageTypeVector>("storage_type");
 
   std::multimap<size_t, NDArray> new_pool;
@@ -827,7 +891,7 @@ inline std::multimap<size_t, NDArray> AllocateMemory(
         new_pool.insert(*iter);
         pool.erase(iter);
       } else {
-        NDArray buff(TShape({static_cast<nnvm::dim_t>(mem_plan[i].size)}),
+        NDArray buff(mxnet::TShape({static_cast<nnvm::dim_t>(mem_plan[i].size)}),
                      default_ctx, true, mshadow::kUint8);
         *arrays[i] = buff.AsArray(shapes[i], dtypes[i]);
         new_pool.insert({mem_plan[i].size, buff});
@@ -928,7 +992,6 @@ inline void CreateEngineOpSeg(
     const size_t start_nid,
     const size_t end_nid,
     const size_t bulk_size,
-    const std::unordered_set<uint32_t>& excludes,
     const std::vector<std::shared_ptr<exec::OpExecutor> >& execs,
     const std::vector<int> skip_plus_node,
     std::vector<EngineOprSeg> *opr_segs) {
@@ -944,13 +1007,6 @@ inline void CreateEngineOpSeg(
 
     // Stop at async nodes and invalid node (due to input/output is not allocated)
     bool stop = is_async || !valid || seg_execs.size() >= bulk_size;
-    for (size_t i = 0; i < node.inputs.size() && !stop; ++i) {
-      if (excludes.count(idx.entry_id(node.inputs[i]))) stop = true;
-    }
-    auto num_outputs = node.source->num_outputs();
-    for (size_t i = 0; i < num_outputs && !stop; ++i) {
-      if (excludes.count(idx.entry_id(nid, i))) stop = true;
-    }
 
     // Create opr segment for previous nodes.
     if (stop && nid > seg_start) {
@@ -994,13 +1050,26 @@ inline void CreateEngineOpSeg(
 
 void RunGraph(const bool retain_graph,
               const nnvm::IndexedGraph& idx,
-              const std::vector<NDArray*> arrays,
+              const std::vector<NDArray*>& arrays,
               size_t node_start, size_t node_end,
               std::vector<OpReqType>&& array_reqs,
               std::vector<uint32_t>&& ref_count,
               std::vector<OpStatePtr> *p_states,
               const DispatchModeVector &dispatch_modes,
-              bool recording);
+              bool recording,
+              mxnet::ShapeVector *shapes = nullptr);
+
+void NaiveRunGraph(const bool retain_graph,
+                   const Context& default_ctx,
+                   const nnvm::IndexedGraph& idx,
+                   const std::vector<NDArray*>& arrays,
+                   size_t node_start, size_t node_end,
+                   std::vector<OpReqType>&& array_reqs,
+                   std::vector<uint32_t>&& ref_count,
+                   std::vector<OpStatePtr> *p_states,
+                   const DispatchModeVector &dispatch_modes,
+                   bool recording,
+                   mxnet::ShapeVector *shapes);
 
 }  // namespace imperative
 }  // namespace mxnet

@@ -30,11 +30,15 @@ blacklist = [
     'opencv2/opencv.hpp', 'sys/stat.h', 'sys/types.h', 'cuda.h', 'cuda_fp16.h', 'omp.h',
     'onnx/onnx.pb.h', 'execinfo.h', 'packet/sse-inl.h', 'emmintrin.h', 'thrust/device_vector.h',
     'cusolverDn.h', 'internal/concurrentqueue_internal_debug.h', 'relacy/relacy_std.hpp',
-    'relacy_shims.h', 'ittnotify.h', 'shared_mutex'
+    'relacy_shims.h', 'ittnotify.h', 'shared_mutex', 'nvToolsExt.h',
+    'x86intrin.h',
     ]
 
 minimum = int(sys.argv[6]) if len(sys.argv) > 5 else 0
 android = int(sys.argv[7]) if len(sys.argv) > 6 else 0
+
+# print(sys.argv)
+# sys.exit(1)
 
 # blacklist linear algebra headers when building without blas.
 if minimum != 0:
@@ -46,6 +50,14 @@ if platform.system() != 'Darwin':
 if platform.system() != 'Windows':
     blacklist.append('windows.h')
     blacklist.append('process.h')
+    blacklist.append('Shlwapi.h')
+
+if platform.system() == 'Windows':
+    blacklist.append('unistd.h')
+
+if 'freebsd' not in sys.platform:
+    blacklist.append('sys/endian.h')
+
 
 
 def get_sources(def_file):
@@ -94,6 +106,7 @@ def find_source(name, start, stage):
 
 re1 = re.compile('<([./a-zA-Z0-9_-]*)>')
 re2 = re.compile('"([./a-zA-Z0-9_-]*)"')
+re3 = re.compile('DMLC_EXECINFO_H')
 
 sysheaders = []
 history = set([])
@@ -129,7 +142,16 @@ def expand(x, pending, stage):
     with open(x, 'rb') as x_h:
         for line in x_h.readlines():
             uline = line.decode('utf-8')
+            if '#define DMLC_LOG_STACK_TRACE 1' in uline.strip():
+                # Do not enable stacktrace logging
+                continue
             if uline.find('#include') < 0:
+                if uline.find('__BYTE_ORDER') > 0:
+                    line = re.sub(r'__BYTE_ORDER', '__BYTE_ORDER__', line.decode('utf-8'))
+                    line = line.encode('utf-8')
+                if uline.find('__LITTLE_ENDIAN') > 0:
+                    line = re.sub(r'__LITTLE_ENDIAN', '__LITTLE_ENDIAN__', line.decode('utf-8'))
+                    line = line.encode('utf-8')
                 out.write(line)
                 continue
             if uline.strip().find('#include') > 0:
@@ -138,12 +160,22 @@ def expand(x, pending, stage):
             m = re1.search(uline)
             if not m:
                 m = re2.search(uline)
-            if not m:
-                print(uline + ' not found')
-                continue
-            path = m.groups()[0]
+            if m:
+                path = m.groups()[0]
+            else:
+                m = re3.search(uline)
+                if m:
+                    path = 'execinfo.h'
+                else:
+                    print(uline + ' not found')
+                    continue
             h = path.strip('./') if "../3rdparty/" not in path else path
-            source = find_source(h, x, stage)
+            if h.endswith('complex.h') and x.endswith('openblas_config.h'):
+                source = ''
+            elif h.startswith('ps/'):
+                source = '../3rdparty/ps-lite/include/' + h
+            else:
+                source = find_source(h, x, stage)
             if not source:
                 if (h not in blacklist and
                     h not in sysheaders and
